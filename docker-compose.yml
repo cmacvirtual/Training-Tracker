@@ -1,0 +1,14 @@
+services:
+  training-tracker:
+    build: .
+    container_name: training-tracker
+    ports:
+      - "8501:8501"
+    volumes:
+      - training_tracker_data:/data
+    environment:
+      - DB_PATH=/data/training_tracker.db
+    restart: unless-stopped
+
+volumes:
+  training_tracker_data:
