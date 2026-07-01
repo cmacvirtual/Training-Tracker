@@ -1,19 +1,24 @@
-# Training Operations Tracker v3
+# Training Operations Tracker v5.1
 
-A Dockerized Streamlit app for managing instructor-led training operations.
+Dockerized Streamlit app for managing instructor-led training, public class signup, lab POD readiness, course completions, certificates, and reporting.
 
-## v3 Highlights
+## v5.1 Highlights
 
-- Instructor login system with Admin-created accounts
-- Default first-run admin account: `admin` / `admin123`
-- Course roster view for a specific class session
-- Lab POD readiness tracking per student
-- Visual POD readiness indicator that changes between red, orange, and green
-- POD name / ID and setup notes per enrolled student
-- Roster export for selected class session
-- Instructors, attendees, courses, sessions, enrollments, completions, certificates, dashboard, and Excel export
+- Public-facing training portal inside the same app
+- Compact public upcoming class tiles
+- Click a specific class tile, then submit signup details for that selected class
+- Public registration status lookup by email
+- Instructor/admin login with user management
+- Course, instructor, attendee, and session management
+- Signup request approval, waitlist, and drop workflow
+- Course roster view with POD readiness indicators
+- New Lab Builder Queue with account, snapshot, docs, and ready indicators
+- End-of-course completion editing and bulk completion updates
+- Certificate issued tracking
+- Excel exports for reports, rosters, signups, and lab queues
+- SQLite persistence using a Docker volume
 
-## Run
+## Run Locally
 
 ```bash
 docker compose up --build
@@ -25,29 +30,60 @@ Open:
 http://localhost:8501
 ```
 
-## First Login
+## Default Login
 
 ```text
 Username: admin
 Password: admin123
 ```
 
-To change the first-run default password before the database is created, set:
+Change the password after first launch by creating another admin user or setting the environment variable below before the first database is created.
 
-```bash
-DEFAULT_ADMIN_PASSWORD=yourStrongPassword
+```yaml
+environment:
+  - DEFAULT_ADMIN_PASSWORD=ChangeMeNow123!
 ```
 
-Example:
+## Public Portal
 
-```bash
-DEFAULT_ADMIN_PASSWORD='ChangeMe123!' docker compose up --build
+When the app opens and no one is signed in, users land on the public signup portal. They can:
+
+- View upcoming classes
+- Request a seat
+- Check registration status by email
+- Go to Instructor/Admin Sign In
+
+After logging in, admins can also access **Public Portal Preview** from the sidebar.
+
+## Network Deployment Notes
+
+For internal network use, place this behind your normal reverse proxy or internal DNS name, for example:
+
+```text
+http://training.company.local
 ```
 
-## Data Storage
+Recommended additions before broader production use:
 
-The app uses SQLite at `/data/training_tracker.db` inside the container. The Docker Compose file mounts this to a local `./data` folder.
+- Put behind HTTPS using NGINX, Caddy, Traefik, or an enterprise load balancer
+- Set a strong default admin password before first launch
+- Restrict container host access
+- Back up the `/data/training_tracker.db` volume
+- Consider PostgreSQL if multiple concurrent instructors will be using it heavily
 
-## Notes
+## Data Persistence
 
-This authentication is intended for a lightweight internal tool. For internet-facing production use, place the app behind SSO, reverse proxy authentication, or another enterprise identity provider.
+The app uses SQLite at:
+
+```text
+/data/training_tracker.db
+```
+
+The Docker compose file maps this to a named Docker volume.
+
+## Files
+
+- `app/app.py` - Streamlit application
+- `Dockerfile` - container build
+- `docker-compose.yml` - local deployment
+- `requirements.txt` - Python dependencies
