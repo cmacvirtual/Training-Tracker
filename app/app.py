@@ -11,7 +11,7 @@ import plotly.express as px
 import streamlit as st
 
 DB_PATH = os.getenv("DB_PATH", "/data/training_tracker.db")
-APP_VERSION = "v3.0"
+APP_VERSION = "v5"
 
 st.set_page_config(
     page_title="Training Operations Tracker",
@@ -67,6 +67,13 @@ CUSTOM_CSS = """
     .metric-value {font-size: 2rem; font-weight: 800; color: #102a43; line-height: 1.05;}
     .metric-help {font-size: .78rem; color: #667085; margin-top: .35rem;}
     .status-pill {display:inline-block; padding:.22rem .55rem; border-radius:999px; font-size:.75rem; font-weight:700;}
+    .public-class-card {background:#ffffff; border:1px solid #e7ecf3; border-radius:14px; padding:.72rem .82rem; margin:.25rem 0 .45rem 0; box-shadow:0 6px 16px rgba(16,42,67,.05); min-height:150px;}
+    .public-class-title {font-size:.94rem; font-weight:800; color:#102a43; line-height:1.15;}
+    .public-class-meta {color:#667085; font-size:.78rem; margin-top:.18rem; line-height:1.25;}
+    .seat-pill {display:inline-block; padding:.16rem .45rem; border-radius:999px; font-size:.72rem; font-weight:800; margin-top:.35rem;}
+    .seat-open {background:#e7f7ef; color:#087443;}
+    .seat-full {background:#fdecec; color:#b42318;}
+    .selected-class-box {background:linear-gradient(135deg,#f8fbff,#eef6ff); border:1px solid #cfe1f7; border-radius:16px; padding:1rem; margin:.75rem 0 1rem 0;}
     .pod-ready {background:#e7f7ef; border:2px solid #16865f; color:#087443; border-radius:16px; padding:.9rem; text-align:center; font-weight:800; box-shadow:0 0 0 4px rgba(22,134,95,.08);}
     .pod-not-ready {background:#fdecec; border:2px solid #b42318; color:#b42318; border-radius:16px; padding:.9rem; text-align:center; font-weight:800; box-shadow:0 0 0 4px rgba(180,35,24,.08);}
     .pod-partial {background:#fff3dc; border:2px solid #b26a00; color:#b26a00; border-radius:16px; padding:.9rem; text-align:center; font-weight:800; box-shadow:0 0 0 4px rgba(178,106,0,.08);}
@@ -84,6 +91,15 @@ CUSTOM_CSS = """
         font-weight: 700;
     }
     div.stButton > button:hover, div.stDownloadButton > button:hover {border-color:#2f80ed; background:#2f80ed; color:white;}
+
+    .top-link {text-align:right; margin-bottom:.5rem;}
+    .public-topbar {display:flex; justify-content:space-between; align-items:center; margin-bottom:.75rem;}
+    .portal-badge {background:#eaf2ff; color:#175cd3; border-radius:999px; padding:.25rem .65rem; font-weight:800; font-size:.78rem;}
+    .lab-card {border:1px solid #e7ecf3; border-radius:16px; padding:1rem; background:white; box-shadow:0 8px 24px rgba(16,42,67,.06); margin-bottom:.75rem;}
+    .lab-dot {font-size:1.35rem; line-height:1;}
+    .tiny-label {font-size:.75rem; color:#667085; text-transform:uppercase; letter-spacing:.04em; font-weight:700;}
+    .progress-shell {height:16px; border-radius:999px; background:#eef2f6; overflow:hidden; border:1px solid #e7ecf3;}
+    .progress-fill {height:100%; background:linear-gradient(90deg,#1f4e79,#2f80ed); border-radius:999px;}
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -190,6 +206,10 @@ def init_db():
         "pod_name TEXT",
         "pod_setup_at TEXT",
         "pod_notes TEXT",
+        "pod_account INTEGER DEFAULT 0",
+        "pod_snapshot INTEGER DEFAULT 0",
+        "pod_docs INTEGER DEFAULT 0",
+        "lab_build_status TEXT DEFAULT 'Not Started'",
     ]:
         try:
             cur.execute(f"ALTER TABLE enrollments ADD COLUMN {coldef}")
@@ -212,6 +232,16 @@ def execute(query, params=None):
     cur.execute(query, params or [])
     conn.commit()
     conn.close()
+
+
+def execute_insert(query, params=None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(query, params or [])
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    return row_id
 
 
 def execute_many(query, rows):
@@ -244,12 +274,171 @@ def ensure_default_admin():
         )
 
 
-def require_login():
+def get_upcoming_public_sessions():
+    today = date.today().isoformat()
+    return run_query(
+        """
+        SELECT s.id, s.session_name, s.start_date, s.end_date, s.delivery_type, s.location, s.capacity, s.status,
+               c.title AS course_title, c.course_code, c.category, c.level, c.duration_hours, c.description,
+               i.name AS instructor_name,
+               COALESCE(SUM(CASE WHEN e.enrollment_status IN ('Enrolled','Pending Approval','Waitlisted') THEN 1 ELSE 0 END), 0) AS signed_up,
+               COALESCE(SUM(CASE WHEN e.enrollment_status='Enrolled' THEN 1 ELSE 0 END), 0) AS approved_count,
+               COALESCE(SUM(CASE WHEN e.enrollment_status='Pending Approval' THEN 1 ELSE 0 END), 0) AS pending_count
+        FROM class_sessions s
+        JOIN courses c ON s.course_id = c.id
+        LEFT JOIN instructors i ON s.instructor_id = i.id
+        LEFT JOIN enrollments e ON e.session_id = s.id
+        WHERE c.active=1
+          AND s.status IN ('Scheduled','In Progress')
+          AND s.start_date >= ?
+        GROUP BY s.id
+        ORDER BY s.start_date ASC, c.title ASC
+        """,
+        [today],
+    )
+
+
+def submit_public_signup(session_id, name, email, organization, role, notes):
+    email = email.strip().lower()
+    existing_attendee = run_query("SELECT id FROM attendees WHERE lower(email)=? LIMIT 1", [email])
+    if existing_attendee.empty:
+        attendee_id = execute_insert(
+            "INSERT INTO attendees (name, email, organization, role, status, notes) VALUES (?, ?, ?, ?, 'Active', ?)",
+            [name.strip(), email, organization.strip(), role.strip(), f"Self-signup created {datetime.now().isoformat(timespec='seconds')}"]
+        )
+    else:
+        attendee_id = int(existing_attendee.iloc[0]["id"])
+        execute(
+            "UPDATE attendees SET name=COALESCE(NULLIF(?, ''), name), organization=COALESCE(NULLIF(?, ''), organization), role=COALESCE(NULLIF(?, ''), role) WHERE id=?",
+            [name.strip(), organization.strip(), role.strip(), attendee_id]
+        )
+    try:
+        execute(
+            """
+            INSERT INTO enrollments (session_id, attendee_id, enrollment_status, completion_status, notes)
+            VALUES (?, ?, 'Pending Approval', 'Not Started', ?)
+            """,
+            [session_id, attendee_id, f"Self-signup request submitted {datetime.now().isoformat(timespec='seconds')}. {notes}".strip()]
+        )
+        return True, "Signup submitted. An instructor/admin can approve the request from Signup Requests."
+    except sqlite3.IntegrityError:
+        return False, "That email is already signed up for this class. Contact the instructor/admin if the status needs to be changed."
+
+
+def public_signup_page(show_login_button=True):
+    hero("Upcoming Training Signup", "Browse upcoming classes, select one, then request a seat for that specific class. Instructor/admin areas require sign-in.")
+    sessions = get_upcoming_public_sessions()
+    if sessions.empty:
+        st.info("There are no upcoming classes open for signup yet.")
+    else:
+        st.markdown("### Upcoming Classes")
+        st.caption("Select a class tile to open the signup form for that specific session.")
+
+        if "selected_public_session_id" not in st.session_state and not sessions.empty:
+            st.session_state["selected_public_session_id"] = int(sessions.iloc[0]["id"])
+
+        cols_per_row = 3
+        rows = [sessions.iloc[i:i + cols_per_row] for i in range(0, len(sessions), cols_per_row)]
+        for group in rows:
+            cols = st.columns(cols_per_row)
+            for idx, (_, row) in enumerate(group.iterrows()):
+                with cols[idx]:
+                    remaining = max(int(row["capacity"] or 0) - int(row["approved_count"] or 0), 0)
+                    seat_class = "seat-open" if remaining > 0 else "seat-full"
+                    seat_label = f"{remaining} seats left" if remaining > 0 else "Full / waitlist"
+                    selected = int(st.session_state.get("selected_public_session_id", 0)) == int(row["id"])
+                    card_border = "#2f80ed" if selected else "#e7ecf3"
+                    card = f"""
+                    <div class="public-class-card" style="border-color:{card_border};">
+                        <div class="public-class-title">{row['course_title']}</div>
+                        <div class="public-class-meta"><b>{row['session_name']}</b></div>
+                        <div class="public-class-meta">{row['start_date']} → {row['end_date']}</div>
+                        <div class="public-class-meta">{row['delivery_type'] or ''} · {row['location'] or 'Location TBD'}</div>
+                        <div class="public-class-meta">Instructor: {row['instructor_name'] or 'TBD'}</div>
+                        <div class="seat-pill {seat_class}">{seat_label}</div>
+                    </div>
+                    """
+                    st.markdown(card, unsafe_allow_html=True)
+                    button_label = "Selected" if selected else "Select Class"
+                    if st.button(button_label, key=f"select_public_session_{int(row['id'])}", use_container_width=True):
+                        st.session_state["selected_public_session_id"] = int(row["id"])
+                        st.rerun()
+
+        selected_id = int(st.session_state.get("selected_public_session_id", int(sessions.iloc[0]["id"])))
+        selected_row = sessions[sessions["id"] == selected_id]
+        if selected_row.empty:
+            selected_row = sessions.iloc[[0]]
+            selected_id = int(selected_row.iloc[0]["id"])
+            st.session_state["selected_public_session_id"] = selected_id
+        selected_row = selected_row.iloc[0]
+        selected_remaining = max(int(selected_row["capacity"] or 0) - int(selected_row["approved_count"] or 0), 0)
+
+        st.markdown("### Request a Seat")
+        st.markdown(
+            f"""
+            <div class="selected-class-box">
+                <div class="public-class-title">Signing up for: {selected_row['course_title']} · {selected_row['session_name']}</div>
+                <div class="public-class-meta">{selected_row['start_date']} to {selected_row['end_date']} · {selected_row['delivery_type'] or ''} · {selected_row['location'] or 'Location TBD'}</div>
+                <div class="public-class-meta">Capacity: {int(selected_row['capacity'] or 0)} · Approved: {int(selected_row['approved_count'] or 0)} · Pending: {int(selected_row['pending_count'] or 0)} · Seats remaining: {selected_remaining}</div>
+                <div class="public-class-meta">{selected_row['description'] or ''}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.form("public_signup_form"):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Full Name *")
+            email = c2.text_input("Email *")
+            c3, c4 = st.columns(2)
+            organization = c3.text_input("Organization")
+            role = c4.text_input("Role / Job Title")
+            notes = st.text_area("Notes / Questions")
+            submitted = st.form_submit_button("Submit Signup Request")
+            if submitted:
+                if not name.strip() or not email.strip() or "@" not in email:
+                    st.error("Full name and a valid email are required.")
+                else:
+                    ok, message = submit_public_signup(selected_id, name, email, organization, role, notes)
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.warning(message)
+    st.divider()
+    st.markdown("### Check Registration Status")
+    with st.form("public_status_check"):
+        status_email = st.text_input("Email used for signup")
+        check = st.form_submit_button("Check Status")
+        if check:
+            if not status_email.strip():
+                st.warning("Enter the email address used during signup.")
+            else:
+                status_df = run_query("""
+                    SELECT a.name, c.title AS course, s.session_name, s.start_date, e.enrollment_status, e.completion_status, e.pod_name, e.pod_setup
+                    FROM enrollments e
+                    JOIN attendees a ON e.attendee_id=a.id
+                    JOIN class_sessions s ON e.session_id=s.id
+                    JOIN courses c ON s.course_id=c.id
+                    WHERE lower(a.email)=lower(?)
+                    ORDER BY s.start_date DESC
+                """, [status_email.strip()])
+                if status_df.empty:
+                    st.info("No registrations found for that email address.")
+                else:
+                    st.dataframe(status_df, use_container_width=True, hide_index=True)
+    if show_login_button:
+        st.divider()
+        c1, c2 = st.columns([3,1])
+        with c1:
+            st.caption("Instructor and admin functions are protected. Public users can browse and register without signing in.")
+        with c2:
+            if st.button("Instructor/Admin Sign In"):
+                st.session_state["show_login"] = True
+                st.rerun()
+
+
+def login_page():
     ensure_default_admin()
-    if st.session_state.get("authenticated"):
-        return
-    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-    hero("Training Operations Tracker", "Sign in to manage instructors, attendees, courses, class rosters, lab POD readiness, and completions.")
+    hero("Instructor/Admin Sign In", "Manage instructors, attendees, courses, class rosters, lab POD readiness, signups, and completions.")
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -263,7 +452,22 @@ def require_login():
             else:
                 st.error("Invalid username or password, or the account is inactive.")
     st.info("First run default account: username `admin`, password `admin123`. Change this by creating another admin account or setting DEFAULT_ADMIN_PASSWORD before first launch.")
+    if st.button("Back to Public Signup"):
+        st.session_state["show_login"] = False
+        st.rerun()
     st.stop()
+
+
+def require_login():
+    ensure_default_admin()
+    if st.session_state.get("authenticated"):
+        return
+    st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+    if st.session_state.get("show_login"):
+        login_page()
+    else:
+        public_signup_page(show_login_button=True)
+        st.stop()
 
 
 def options_from_df(df, label_col="name"):
@@ -313,7 +517,7 @@ def seed_demo_data():
         VALUES (1,1,'VCF 9 Deployment Lab - June Cohort',?,?,?,?,?,?,?)
     """, [date.today().isoformat(), date.today().isoformat(), "Virtual", "Teams / Lab Portal", 12, "Scheduled", "Demo seeded session"])
     for idx, attendee_id in enumerate([1, 2, 3], start=1):
-        execute("INSERT INTO enrollments (session_id, attendee_id, enrollment_status, completion_status, score, certificate_issued, pod_setup, pod_name, pod_notes, notes) VALUES (1, ?, 'Enrolled', 'Not Started', 0, 0, ?, ?, '', '')", [attendee_id, 1 if idx < 3 else 0, f"POD-{idx:02d}"])
+        execute("INSERT INTO enrollments (session_id, attendee_id, enrollment_status, completion_status, score, certificate_issued, pod_setup, pod_account, pod_snapshot, pod_docs, lab_build_status, pod_name, pod_notes, notes) VALUES (1, ?, 'Enrolled', 'Not Started', 0, 0, ?, ?, ?, ?, ?, ?, '', '')", [attendee_id, 1 if idx < 3 else 0, 1 if idx < 3 else 0, 1 if idx == 1 else 0, 1 if idx == 1 else 0, 'Ready' if idx == 1 else ('Building' if idx == 2 else 'Not Started'), f"POD-{idx:02d}"])
     return True
 
 
@@ -360,12 +564,15 @@ with st.sidebar:
         "Navigation",
         [
             "Command Center",
+            "Public Portal Preview",
             "Instructors",
             "Attendees",
             "Courses",
             "Class Sessions",
             "Enrollments & Completions",
             "Course Rosters & PODs",
+            "Lab Builder Queue",
+            "Signup Requests",
             "Reports & Export",
             "User Management",
             "Admin",
@@ -409,6 +616,10 @@ completion_df = run_query(
         e.score,
         e.certificate_issued,
         e.pod_setup,
+        e.pod_account,
+        e.pod_snapshot,
+        e.pod_docs,
+        e.lab_build_status,
         e.pod_name,
         e.pod_setup_at,
         e.pod_notes,
@@ -476,6 +687,71 @@ if menu == "Command Center":
     if not display_sessions.empty:
         display_sessions = display_sessions[["session_name", "course_title", "instructor_name", "start_date", "end_date", "delivery_type", "capacity", "status", "location"]]
     st.dataframe(display_sessions, use_container_width=True, hide_index=True)
+
+elif menu == "Public Portal Preview":
+    public_signup_page(show_login_button=False)
+
+elif menu == "Lab Builder Queue":
+    hero("Lab Builder Queue", "Track the build lifecycle for student lab PODs across upcoming classes.")
+    roster = completion_df[completion_df["enrollment_status"].isin(["Enrolled", "Pending Approval", "Waitlisted"])] if not completion_df.empty else completion_df
+    if roster.empty:
+        st.info("No enrolled or pending students yet.")
+    else:
+        session_names = sorted(roster["session_name"].dropna().unique())
+        selected_session = st.selectbox("Class Session", session_names)
+        session_roster = roster[roster["session_name"] == selected_session].copy()
+        total = len(session_roster)
+        ready = int((session_roster["pod_setup"] == 1).sum()) if "pod_setup" in session_roster else 0
+        pct = int((ready / total) * 100) if total else 0
+        c1, c2, c3 = st.columns(3)
+        with c1: metric_card("Students", total, "Roster records")
+        with c2: metric_card("PODs Ready", ready, "Marked green")
+        with c3: metric_card("Build Progress", f"{pct}%", "Ready / total")
+        st.markdown(f'<div class="progress-shell"><div class="progress-fill" style="width:{pct}%"></div></div>', unsafe_allow_html=True)
+        st.markdown("### POD Build Board")
+        for _, r in session_roster.iterrows():
+            pod_ready = int(r.get("pod_setup") or 0) == 1
+            account = int(r.get("pod_account") or 0) == 1
+            snapshot = int(r.get("pod_snapshot") or 0) == 1
+            docs = int(r.get("pod_docs") or 0) == 1
+            status_class = "pod-ready" if pod_ready else ("pod-partial" if account or snapshot or docs else "pod-not-ready")
+            status_label = "🟢 Ready" if pod_ready else ("🟡 Building" if account or snapshot or docs else "🔴 Not Started")
+            with st.container():
+                st.markdown(f'<div class="lab-card"><b>{r["attendee"]}</b> · <span class="muted">{r.get("attendee_email", "")}</span><br><span class="tiny-label">{r.get("pod_name") or "No POD Assigned"}</span></div>', unsafe_allow_html=True)
+                a,b,c,d,e,f = st.columns([1.2,1,1,1,1,1.3])
+                with a: st.markdown(f'<div class="{status_class}">{status_label}</div>', unsafe_allow_html=True)
+                with b: st.markdown(f'<div class="lab-dot">{"🟢" if account else "🔴"}</div><div class="tiny-label">Account</div>', unsafe_allow_html=True)
+                with c: st.markdown(f'<div class="lab-dot">{"🟢" if snapshot else "🔴"}</div><div class="tiny-label">Snapshot</div>', unsafe_allow_html=True)
+                with d: st.markdown(f'<div class="lab-dot">{"🟢" if docs else "🔴"}</div><div class="tiny-label">Docs</div>', unsafe_allow_html=True)
+                with e: st.markdown(f'<div class="lab-dot">{"🟢" if pod_ready else "🔴"}</div><div class="tiny-label">Ready</div>', unsafe_allow_html=True)
+                with f:
+                    if st.button("Update", key=f"lab_update_{int(r['id'])}"):
+                        st.session_state["lab_edit_id"] = int(r["id"])
+        st.divider()
+        edit_id = st.session_state.get("lab_edit_id")
+        if edit_id:
+            row = completion_df[completion_df["id"] == edit_id].iloc[0]
+            st.markdown(f"### Update Lab Build: {row['attendee']}")
+            with st.form("lab_builder_update_form"):
+                c1, c2, c3, c4 = st.columns(4)
+                pod_name = c1.text_input("POD Name", value=str(row.get("pod_name") or ""))
+                pod_account = c2.checkbox("Account Created", value=bool(row.get("pod_account") or 0))
+                pod_snapshot = c3.checkbox("Snapshot Created", value=bool(row.get("pod_snapshot") or 0))
+                pod_docs = c4.checkbox("Docs/Credentials Sent", value=bool(row.get("pod_docs") or 0))
+                pod_setup = st.checkbox("Overall POD Ready", value=bool(row.get("pod_setup") or 0))
+                build_status = st.selectbox("Build Status", ["Not Started", "Building", "Ready", "Blocked"], index=["Not Started", "Building", "Ready", "Blocked"].index(str(row.get("lab_build_status") or "Not Started")) if str(row.get("lab_build_status") or "Not Started") in ["Not Started", "Building", "Ready", "Blocked"] else 0)
+                pod_notes = st.text_area("Lab Notes", value=str(row.get("pod_notes") or ""))
+                if st.form_submit_button("Save Lab Build Status"):
+                    timestamp = datetime.now().isoformat(timespec="seconds") if pod_setup else row.get("pod_setup_at")
+                    execute("""
+                        UPDATE enrollments
+                        SET pod_name=?, pod_account=?, pod_snapshot=?, pod_docs=?, pod_setup=?, pod_setup_at=?, lab_build_status=?, pod_notes=?
+                        WHERE id=?
+                    """, [pod_name, int(pod_account), int(pod_snapshot), int(pod_docs), int(pod_setup), timestamp, build_status, pod_notes, edit_id])
+                    st.success("Lab build status updated.")
+                    st.session_state.pop("lab_edit_id", None)
+                    st.rerun()
+        st.download_button("Download Lab Builder Queue", data=export_excel({"Lab Builder Queue": session_roster}), file_name=f"lab_builder_queue_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif menu == "Instructors":
     hero("Instructor Management", "Maintain instructor profiles, delivery focus areas, availability status, and notes.")
@@ -573,19 +849,21 @@ elif menu == "Class Sessions":
         st.dataframe(sessions_df, use_container_width=True, hide_index=True)
 
 elif menu == "Enrollments & Completions":
-    hero("Enrollments & Completions", "Enroll attendees, update pass/fail status, record scores, and issue certificates.")
+    hero("Enrollments & Completions", "Enroll attendees, then return at the end of class to update existing student completion records.")
     if sessions_df.empty or attendees_df.empty:
         st.warning("Create at least one class session and one attendee before enrolling attendees.")
     else:
-        session_options = {f"{row['session_name']} - {row['course_title']} (ID {row['id']})": int(row["id"]) for _, row in sessions_df.iterrows()}
+        session_options = {f"{row['session_name']} - {row['course_title']} ({row['start_date']}) [ID {row['id']} ]": int(row["id"]) for _, row in sessions_df.iterrows()}
         attendee_options = options_from_df(attendees_df, "name")
-        tab1, tab2 = st.tabs(["Enroll Attendee", "Update Completion"])
+        tab1, tab2, tab3 = st.tabs(["Enroll Attendee", "Update by Class Roster", "Update Single Enrollment"])
+
         with tab1:
+            st.info("Use this when initially signing students up for a class. Existing enrollments can be edited in the roster tabs after the course.")
             with st.form("add_enrollment"):
                 session_label = st.selectbox("Class Session", list(session_options.keys()))
                 attendee_label = st.selectbox("Attendee", list(attendee_options.keys()))
                 c1, c2, c3 = st.columns(3)
-                enrollment_status = c1.selectbox("Enrollment Status", ["Enrolled", "Waitlisted", "Dropped", "No Show"])
+                enrollment_status = c1.selectbox("Enrollment Status", ["Pending Approval", "Enrolled", "Waitlisted", "Dropped", "No Show"])
                 completion_status = c2.selectbox("Completion Status", ["Not Started", "In Progress", "Completed", "Failed", "Incomplete"])
                 certificate_issued = c3.checkbox("Certificate Issued")
                 c4, c5 = st.columns(2)
@@ -606,28 +884,141 @@ elif menu == "Enrollments & Completions":
                         """, [session_options[session_label], attendee_options[attendee_label], enrollment_status, completion_status, completion_date.isoformat() if completion_date else None, score, int(certificate_issued), int(pod_setup), pod_name, datetime.now().isoformat(timespec="seconds") if pod_setup else None, pod_notes, notes])
                         st.success("Enrollment saved."); st.rerun()
                     except sqlite3.IntegrityError:
-                        st.error("That attendee is already enrolled in this session.")
+                        st.error("That attendee is already enrolled in this session. Use the update tabs to edit the existing record.")
+
         with tab2:
+            st.markdown("### End-of-Course Completion Roster")
+            st.caption("Pick the class, then update each student from the roster. This is the main workflow for marking completions after training.")
+            selected_session_label = st.selectbox("Select Class Session", list(session_options.keys()), key="completion_roster_session")
+            selected_session_id = session_options[selected_session_label]
+            roster = run_query(
+                """
+                SELECT e.id, a.name AS attendee, a.email, a.organization, a.role,
+                       e.enrollment_status, e.completion_status, e.completion_date,
+                       e.score, e.certificate_issued, e.pod_setup, e.pod_name, e.notes
+                FROM enrollments e
+                JOIN attendees a ON e.attendee_id = a.id
+                WHERE e.session_id=?
+                ORDER BY a.name
+                """,
+                [selected_session_id],
+            )
+            if roster.empty:
+                st.info("No students are enrolled in this selected class yet.")
+            else:
+                total = len(roster)
+                completed = int((roster["completion_status"] == "Completed").sum())
+                certs = int((roster["certificate_issued"] == 1).sum())
+                ready_pods = int((roster["pod_setup"] == 1).sum())
+                m1, m2, m3, m4 = st.columns(4)
+                with m1: metric_card("Students", total, "Signed up for this class")
+                with m2: metric_card("Completed", completed, "Marked complete")
+                with m3: metric_card("Certificates", certs, "Issued/recorded")
+                with m4: metric_card("PODs Ready", ready_pods, "Lab readiness")
+
+                with st.expander("✅ Bulk mark enrolled students complete", expanded=False):
+                    st.warning("This updates every student in this selected class with Enrollment Status = Enrolled.")
+                    b1, b2, b3 = st.columns(3)
+                    bulk_date = b1.date_input("Bulk Completion Date", value=date.today(), key="bulk_completion_date")
+                    bulk_score = b2.number_input("Bulk Score", min_value=0.0, max_value=100.0, value=100.0, step=1.0, key="bulk_score")
+                    bulk_cert = b3.checkbox("Issue Certificates", value=True, key="bulk_cert")
+                    bulk_notes = st.text_area("Bulk Completion Notes", value="Completed course requirements.", key="bulk_notes")
+                    if st.button("Mark All Enrolled Complete", key="bulk_complete_button"):
+                        execute(
+                            """
+                            UPDATE enrollments
+                            SET completion_status='Completed', completion_date=?, score=?, certificate_issued=?, notes=?
+                            WHERE session_id=? AND enrollment_status='Enrolled'
+                            """,
+                            [bulk_date.isoformat(), bulk_score, int(bulk_cert), bulk_notes, selected_session_id],
+                        )
+                        st.success("Selected class roster updated.")
+                        st.rerun()
+
+                st.markdown("### Student Completion Cards")
+                for _, row in roster.iterrows():
+                    complete_icon = "✅" if row["completion_status"] == "Completed" else "🟠" if row["completion_status"] == "In Progress" else "⚪"
+                    cert_icon = "🎓" if row["certificate_issued"] == 1 else ""
+                    pod_icon = "🟢" if row["pod_setup"] == 1 else "🔴"
+                    with st.expander(f"{complete_icon} {row['attendee']} — {row['completion_status']} {cert_icon} {pod_icon}", expanded=False):
+                        d1, d2, d3, d4 = st.columns(4)
+                        d1.write(f"**Email:** {row['email'] or ''}")
+                        d2.write(f"**Organization:** {row['organization'] or ''}")
+                        d3.write(f"**Enrollment:** {row['enrollment_status']}")
+                        d4.write(f"**POD:** {'Ready' if row['pod_setup'] == 1 else 'Not Ready'}")
+                        with st.form(f"completion_update_{row['id']}"):
+                            c1, c2, c3, c4 = st.columns(4)
+                            enrollment_status_val = c1.selectbox(
+                                "Enrollment Status",
+                                ["Pending Approval", "Enrolled", "Waitlisted", "Dropped", "No Show"],
+                                index=["Pending Approval", "Enrolled", "Waitlisted", "Dropped", "No Show"].index(row["enrollment_status"]) if row["enrollment_status"] in ["Pending Approval", "Enrolled", "Waitlisted", "Dropped", "No Show"] else 0,
+                                key=f"enrollment_status_{row['id']}",
+                            )
+                            completion_choices = ["Not Started", "In Progress", "Completed", "Failed", "Incomplete"]
+                            completion_status_val = c2.selectbox(
+                                "Completion Status",
+                                completion_choices,
+                                index=completion_choices.index(row["completion_status"]) if row["completion_status"] in completion_choices else 0,
+                                key=f"completion_status_{row['id']}",
+                            )
+                            existing_date = date.fromisoformat(row["completion_date"]) if row["completion_date"] else date.today()
+                            completion_date_val = c3.date_input("Completion Date", value=existing_date, key=f"completion_date_{row['id']}")
+                            score_val = c4.number_input("Score", min_value=0.0, max_value=100.0, value=float(row["score"] or 0.0), step=1.0, key=f"score_{row['id']}")
+                            certificate_val = st.checkbox("Certificate Issued", value=bool(row["certificate_issued"]), key=f"cert_{row['id']}")
+                            notes_val = st.text_area("Completion / Enrollment Notes", value=row["notes"] or "", key=f"notes_{row['id']}")
+                            submitted = st.form_submit_button("Save Student Update")
+                            if submitted:
+                                execute(
+                                    """
+                                    UPDATE enrollments
+                                    SET enrollment_status=?, completion_status=?, completion_date=?, score=?, certificate_issued=?, notes=?
+                                    WHERE id=?
+                                    """,
+                                    [enrollment_status_val, completion_status_val, completion_date_val.isoformat(), score_val, int(certificate_val), notes_val, int(row["id"])],
+                                )
+                                st.success(f"Updated {row['attendee']}.")
+                                st.rerun()
+                st.download_button("Download Completion Roster", data=export_excel({"Completion Roster": roster}), file_name=f"completion_roster_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        with tab3:
+            st.markdown("### Update Single Enrollment")
             if completion_df.empty:
                 st.info("No enrollments yet.")
             else:
-                enrollment_options = {f"{row['attendee']} - {row['course']} - {row['session_name']} (ID {row['id']})": int(row["id"]) for _, row in completion_df.iterrows()}
-                with st.form("update_completion"):
+                filter_col1, filter_col2 = st.columns(2)
+                course_filter = filter_col1.selectbox("Filter by Course", ["All"] + sorted(completion_df["course"].dropna().unique().tolist()))
+                status_filter = filter_col2.selectbox("Filter by Completion Status", ["All"] + sorted(completion_df["completion_status"].dropna().unique().tolist()))
+                single_df = completion_df.copy()
+                if course_filter != "All": single_df = single_df[single_df["course"] == course_filter]
+                if status_filter != "All": single_df = single_df[single_df["completion_status"] == status_filter]
+                if single_df.empty:
+                    st.info("No enrollment records match the selected filters.")
+                else:
+                    enrollment_options = {f"{row['attendee']} - {row['course']} - {row['session_name']} (ID {row['id']})": int(row["id"]) for _, row in single_df.iterrows()}
                     selected = st.selectbox("Enrollment", list(enrollment_options.keys()))
-                    c1, c2, c3 = st.columns(3)
-                    completion_status = c1.selectbox("New Completion Status", ["Not Started", "In Progress", "Completed", "Failed", "Incomplete"], index=2)
-                    completion_date = c2.date_input("New Completion Date", value=date.today())
-                    score = c3.number_input("New Score", min_value=0.0, max_value=100.0, value=100.0, step=1.0)
-                    certificate_issued = st.checkbox("Certificate Issued", value=True)
-                    notes = st.text_area("Completion Notes")
-                    submitted = st.form_submit_button("Update Completion")
-                    if submitted:
-                        execute("""
-                            UPDATE enrollments SET completion_status=?, completion_date=?, score=?, certificate_issued=?, notes=? WHERE id=?
-                        """, [completion_status, completion_date.isoformat(), score, int(certificate_issued), notes, enrollment_options[selected]])
-                        st.success("Completion updated."); st.rerun()
+                    selected_id = enrollment_options[selected]
+                    current = single_df[single_df["id"] == selected_id].iloc[0]
+                    with st.form("update_single_completion"):
+                        c1, c2, c3 = st.columns(3)
+                        completion_choices = ["Not Started", "In Progress", "Completed", "Failed", "Incomplete"]
+                        completion_status = c1.selectbox("Completion Status", completion_choices, index=completion_choices.index(current["completion_status"]) if current["completion_status"] in completion_choices else 0)
+                        current_date = date.fromisoformat(current["completion_date"]) if current["completion_date"] else date.today()
+                        completion_date = c2.date_input("Completion Date", value=current_date)
+                        score = c3.number_input("Score", min_value=0.0, max_value=100.0, value=float(current["score"] or 0.0), step=1.0)
+                        certificate_issued = st.checkbox("Certificate Issued", value=bool(current["certificate_issued"]))
+                        notes = st.text_area("Completion Notes", value=current["notes"] or "")
+                        submitted = st.form_submit_button("Update Completion")
+                        if submitted:
+                            execute(
+                                """
+                                UPDATE enrollments SET completion_status=?, completion_date=?, score=?, certificate_issued=?, notes=? WHERE id=?
+                                """,
+                                [completion_status, completion_date.isoformat(), score, int(certificate_issued), notes, selected_id],
+                            )
+                            st.success("Completion updated.")
+                            st.rerun()
+        st.markdown("### All Enrollment / Completion Records")
         st.dataframe(completion_df, use_container_width=True, hide_index=True)
-
 
 elif menu == "Course Rosters & PODs":
     hero("Course Rosters & Lab POD Readiness", "Select a specific class session to view enrolled students and mark each student's lab POD as ready.")
@@ -735,6 +1126,48 @@ elif menu == "User Management":
                 execute("UPDATE users SET active=? WHERE id=?", [int(active), user_options[selected_user]])
                 st.success("Account status updated.")
                 st.rerun()
+
+elif menu == "Signup Requests":
+    hero("Signup Requests", "Review student self-registration requests and approve, waitlist, or decline them.")
+    signup_df = run_query(
+        """
+        SELECT e.id, a.name AS attendee, a.email, a.organization, a.role,
+               c.title AS course, s.session_name, s.start_date, s.end_date, s.capacity,
+               e.enrollment_status, e.created_at, e.notes,
+               COALESCE((SELECT COUNT(*) FROM enrollments ee WHERE ee.session_id=s.id AND ee.enrollment_status='Enrolled'), 0) AS approved_count
+        FROM enrollments e
+        JOIN attendees a ON e.attendee_id=a.id
+        JOIN class_sessions s ON e.session_id=s.id
+        JOIN courses c ON s.course_id=c.id
+        WHERE e.enrollment_status='Pending Approval'
+        ORDER BY s.start_date ASC, e.created_at ASC
+        """
+    )
+    if signup_df.empty:
+        st.success("No pending signup requests right now.")
+    else:
+        m1, m2 = st.columns(2)
+        with m1: metric_card("Pending Requests", len(signup_df), "Awaiting instructor/admin review")
+        with m2: metric_card("Affected Classes", signup_df["session_name"].nunique(), "Upcoming sessions with requests")
+        st.dataframe(signup_df, use_container_width=True, hide_index=True)
+        st.markdown("### Review Request")
+        request_options = {f"{r['attendee']} → {r['course']} / {r['session_name']} ({r['start_date']}) [ID {r['id']} ]": int(r["id"]) for _, r in signup_df.iterrows()}
+        selected_request = st.selectbox("Signup Request", list(request_options.keys()))
+        selected_id = request_options[selected_request]
+        selected_row = signup_df[signup_df["id"] == selected_id].iloc[0]
+        seats_remaining = max(int(selected_row["capacity"] or 0) - int(selected_row["approved_count"] or 0), 0)
+        st.info(f"Approved seats: {int(selected_row['approved_count'] or 0)} / {int(selected_row['capacity'] or 0)} · Seats remaining: {seats_remaining}")
+        with st.form("review_signup_form"):
+            c1, c2 = st.columns(2)
+            new_status = c1.selectbox("Decision", ["Enrolled", "Waitlisted", "Dropped"], help="Use Dropped to decline/remove the request from the active roster.")
+            reviewer_notes = c2.text_input("Reviewer Notes", placeholder="Approved, waitlisted, declined, etc.")
+            submitted = st.form_submit_button("Update Signup Request")
+            if submitted:
+                note = f"{selected_row['notes'] or ''}\nReview {datetime.now().isoformat(timespec='seconds')}: {reviewer_notes}".strip()
+                execute("UPDATE enrollments SET enrollment_status=?, notes=? WHERE id=?", [new_status, note, selected_id])
+                st.success("Signup request updated.")
+                st.rerun()
+        st.download_button("Download Pending Signup Requests", data=export_excel({"Pending Signups": signup_df}), file_name=f"pending_signups_{datetime.now().strftime('%Y%m%d')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 elif menu == "Reports & Export":
     hero("Reports & Export", "Review training outcomes, delivery load, course demand, completions, and export the full dataset.")
