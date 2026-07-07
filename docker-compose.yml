@@ -1,14 +1,22 @@
 services:
-  training-tracker:
-    build: .
-    container_name: training-tracker
+  backend:
+    build: ./backend
+    container_name: training-toc-api
     ports:
-      - "8501:8501"
+      - "8000:8000"
     volumes:
-      - training_tracker_data:/data
+      - toc_data:/app/data
     environment:
-      - DB_PATH=/data/training_tracker.db
-    restart: unless-stopped
-
+      - TOC_SECRET_KEY=change-this-secret-before-network-use
+      - TOC_DATABASE_URL=sqlite:////app/data/toc.db
+      - TOC_RESET_DEFAULT_ADMIN=true
+      - TOC_ENABLE_BOOTSTRAP_RESET=true
+  frontend:
+    build: ./frontend
+    container_name: training-toc-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
 volumes:
-  training_tracker_data:
+  toc_data:
