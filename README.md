@@ -34,7 +34,6 @@ If you want group-based roles, configure the IdP to include a `groups` claim in 
 ## Start locally
 
 ```bash
-cp .env.example .env
 # Edit .env
 docker compose up --build
 ```
