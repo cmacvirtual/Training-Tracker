@@ -4,7 +4,7 @@ This build adds OIDC Authorization Code Flow while preserving the existing train
 
 ## Environment-specific values to change
 
-Copy `.env.example` to `.env`, then change:
+Change the following in  '.env' to match your specific settings:
 
 1. `TOC_FRONTEND_URL` — the externally reachable app URL, for example `https://training.company.com`.
 2. `TOC_COOKIE_SECURE` — set `true` when the app uses HTTPS.
